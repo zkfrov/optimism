@@ -266,6 +266,9 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
 
             // Initialize the new AnchorStateRegistry. Every chain has the same finality delay
             // (checked in _validateChainSystemConfigs), so the shared registry takes chain 0's.
+            uint256 finalityDelay = IOptimismPortal(payable(_input.chainSystemConfigs[0].optimismPortal()))
+                .anchorStateRegistry()
+                .disputeGameFinalityDelaySeconds();
             _upgrade(
                 proxyDeployArgs.proxyAdmin,
                 address(anchorStateRegistry),
@@ -277,9 +280,7 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
                         disputeGameFactory,
                         _input.startingAnchorRoot,
                         _input.startingRespectedGameType,
-                        IOptimismPortal(payable(_input.chainSystemConfigs[0].optimismPortal()))
-                            .anchorStateRegistry()
-                            .disputeGameFinalityDelaySeconds()
+                        finalityDelay
                     )
                 )
             );
