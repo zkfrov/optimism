@@ -274,14 +274,24 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
                 abi.encodeCall(IDisputeGameFactory.initialize, (proxyDeployArgs.proxyAdmin.owner()))
             );
 
-            // Initialize the new AnchorStateRegistry.
-            _initializeSharedAnchorStateRegistry(
+            // Initialize the new AnchorStateRegistry. Every chain has the same finality delay
+            // (checked in _validateChainSystemConfigs), so the shared registry takes chain 0's.
+            _upgrade(
                 proxyDeployArgs.proxyAdmin,
-                anchorStateRegistry,
+                address(anchorStateRegistry),
                 impls.anchorStateRegistryImpl,
-                ethLockbox,
-                disputeGameFactory,
-                _input
+                abi.encodeCall(
+                    IAnchorStateRegistry.initialize,
+                    (
+                        ethLockbox,
+                        disputeGameFactory,
+                        _input.startingAnchorRoot,
+                        _input.startingRespectedGameType,
+                        IOptimismPortal(payable(_input.chainSystemConfigs[0].optimismPortal()))
+                            .anchorStateRegistry()
+                            .disputeGameFinalityDelaySeconds()
+                    )
+                )
             );
 
             // Migrate each portal to the new ETHLockbox and AnchorStateRegistry.
@@ -322,6 +332,13 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
             // Each chain must have the same SuperchainConfig.
             if (_chainSystemConfigs[i].superchainConfig() != _chainSystemConfigs[0].superchainConfig()) {
                 revert OPContractsManagerMigrator_SuperchainConfigMismatch();
+            }
+
+            // Each chain must have the same finality delay, since the shared AnchorStateRegistry
+            // can only hold one value.
+            if (_disputeGameFinalityDelay(_chainSystemConfigs[i]) != _disputeGameFinalityDelay(_chainSystemConfigs[0]))
+            {
+                revert OPContractsManagerMigrator_DisputeGameFinalityDelayMismatch();
             }
 
             // migrate() is the only thing that sets INTEROP on L1 and SystemConfig does not allow
@@ -592,65 +609,13 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
         );
     }
 
-    /// @notice Initializes the shared AnchorStateRegistry with the finality delay read from the
-    ///         legacy registries.
-    /// @dev    This function is split out of migrate() only because building the initialize
-    ///         calldata inline, with the extra _sharedDisputeGameFinalityDelay() argument, pushes
-    ///         migrate() past the stack limit ("Stack too deep") under the production profile.
-    ///         The delay is read before the shared registry is initialized and before any portal
-    ///         is touched, so a disagreement between chains reverts the whole migration early.
-    /// @param _proxyAdmin The ProxyAdmin that owns the shared proxies.
-    /// @param _anchorStateRegistry The shared AnchorStateRegistry proxy.
-    /// @param _anchorStateRegistryImpl The AnchorStateRegistry implementation.
-    /// @param _ethLockbox The shared ETHLockbox.
-    /// @param _disputeGameFactory The shared DisputeGameFactory.
-    /// @param _input The migration input.
-    function _initializeSharedAnchorStateRegistry(
-        IProxyAdmin _proxyAdmin,
-        IAnchorStateRegistry _anchorStateRegistry,
-        address _anchorStateRegistryImpl,
-        IETHLockbox _ethLockbox,
-        IDisputeGameFactory _disputeGameFactory,
-        MigrateInput calldata _input
-    )
-        internal
-    {
-        _upgrade(
-            _proxyAdmin,
-            address(_anchorStateRegistry),
-            _anchorStateRegistryImpl,
-            abi.encodeCall(
-                IAnchorStateRegistry.initialize,
-                (
-                    _ethLockbox,
-                    _disputeGameFactory,
-                    _input.startingAnchorRoot,
-                    _input.startingRespectedGameType,
-                    _sharedDisputeGameFinalityDelay(_input.chainSystemConfigs)
-                )
-            )
-        );
-    }
-
-    /// @notice Reads the dispute game finality delay that every chain being migrated agrees on.
-    ///         The shared AnchorStateRegistry inherits this value.
-    /// @param _chainSystemConfigs The chain system configs being migrated.
-    /// @return delay_ The agreed dispute game finality delay in seconds.
-    function _sharedDisputeGameFinalityDelay(ISystemConfig[] calldata _chainSystemConfigs)
-        internal
-        view
-        returns (uint256 delay_)
-    {
-        for (uint256 i = 0; i < _chainSystemConfigs.length; i++) {
-            uint256 chainDelay = IOptimismPortal(payable(_chainSystemConfigs[i].optimismPortal()))
-                .anchorStateRegistry()
-                .disputeGameFinalityDelaySeconds();
-            if (i == 0) {
-                delay_ = chainDelay;
-            } else if (chainDelay != delay_) {
-                revert OPContractsManagerMigrator_DisputeGameFinalityDelayMismatch();
-            }
-        }
+    /// @notice Reads a chain's dispute game finality delay from its current AnchorStateRegistry.
+    /// @param _systemConfig The system config for the chain.
+    /// @return The chain's dispute game finality delay in seconds.
+    function _disputeGameFinalityDelay(ISystemConfig _systemConfig) internal view returns (uint256) {
+        return IOptimismPortal(payable(_systemConfig.optimismPortal()))
+            .anchorStateRegistry()
+            .disputeGameFinalityDelaySeconds();
     }
 
     /// @notice Reverts unless every chain being migrated has the same DelayedWETH withdrawal delay.
