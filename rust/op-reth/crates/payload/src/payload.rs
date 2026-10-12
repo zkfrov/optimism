@@ -17,7 +17,6 @@ use alloy_rpc_types_engine::{
 };
 use op_alloy_consensus::{
     EIP1559ParamError, decode_2718_canonical, encode_holocene_extra_data, encode_jovian_extra_data,
-    validate_post_exec_entry_count,
 };
 use op_alloy_rpc_types_engine::{
     OpExecutionPayloadEnvelope, OpExecutionPayloadEnvelopeV3, OpExecutionPayloadEnvelopeV4,
@@ -323,7 +322,7 @@ impl<T: Decodable2718 + Encodable2718 + Send + Sync + Debug + Unpin + 'static>
         attributes: OpPayloadAttributes,
     ) -> Result<Self, alloy_rlp::Error> {
         let encoded_transactions = attributes.transactions.unwrap_or_default();
-        validate_post_exec_entry_count(&encoded_transactions)
+        reth_optimism_evm::validate_post_exec_attributes(&encoded_transactions, parent)
             .map_err(|error| alloy_rlp::Error::Custom(error.as_reason()))?;
         let transactions = encoded_transactions
             .into_iter()
@@ -865,5 +864,116 @@ mod tests {
             attrs,
         )
         .unwrap_err();
+    }
+
+    /// Attributes whose only transaction is a post-exec tx carrying `entries` refund entries.
+    fn attrs_with_post_exec(entries: usize) -> OpPayloadAttributes {
+        use alloy_eips::eip2718::Encodable2718;
+        use op_alloy_consensus::{SDMGasEntry, build_post_exec_tx};
+        let tx = build_post_exec_tx(
+            1,
+            (0..entries).map(|index| SDMGasEntry { index: index as u64, gas_refund: 1 }).collect(),
+        )
+        .encoded_2718();
+        OpPayloadAttributes {
+            payload_attributes: PayloadAttributes {
+                timestamp: 1,
+                prev_randao: B256::ZERO,
+                suggested_fee_recipient: Address::ZERO,
+                withdrawals: Some(vec![]),
+                parent_beacon_block_root: Some(B256::ZERO),
+                slot_number: None,
+                target_gas_limit: None,
+            },
+            transactions: Some(vec![tx.into()]),
+            no_tx_pool: Some(true),
+            gas_limit: Some(30_000_000),
+            eip_1559_params: None,
+            min_base_fee: None,
+        }
+    }
+
+    /// A recorder private to one test, prefixed like the node's recorder stack so the rendered
+    /// series names are the ones operators query.
+    fn recorder() -> (
+        metrics_util::layers::Prefix<metrics_exporter_prometheus::PrometheusRecorder>,
+        metrics_exporter_prometheus::PrometheusHandle,
+    ) {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+        use metrics_util::layers::{Layer, PrefixLayer};
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        (PrefixLayer::new("reth").layer(recorder), handle)
+    }
+
+    /// Reads one exactly-labeled counter out of the exposition; `None` means the series was
+    /// never registered, which distinguishes it from one reporting 0.
+    fn labeled_counter(exposition: &str, metric: &str, label: &str) -> Option<f64> {
+        let prefix = format!("{metric}{{{label}}} ");
+        exposition
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix).and_then(|value| value.trim().parse().ok()))
+    }
+
+    /// A post-exec rejection on the attributes path must reach the same counters as the Engine
+    /// API preflight: the failed rule and a failed validation.
+    #[test]
+    fn rejected_attributes_count_the_failure() {
+        use reth_metrics::metrics::with_local_recorder;
+
+        let (recorder, handle) = recorder();
+
+        let result = with_local_recorder(&recorder, || {
+            OpPayloadBuilderAttributes::<OpTransactionSigned>::from_rpc_attrs(
+                B256::ZERO,
+                PayloadId::new([0; 8]),
+                attrs_with_post_exec(2),
+            )
+        });
+        assert!(result.is_err(), "two refund entries with no preceding transactions must reject");
+
+        let exposition = handle.render();
+        assert_eq!(
+            labeled_counter(
+                &exposition,
+                "reth_op_sdm_post_exec_validation_failure_total",
+                "reason=\"too_many_gas_refund_entries\"",
+            ),
+            Some(1.0),
+            "{exposition}"
+        );
+        assert_eq!(
+            labeled_counter(
+                &exposition,
+                "reth_op_sdm_post_exec_validation_total",
+                "result=\"fail\"",
+            ),
+            Some(1.0),
+            "{exposition}"
+        );
+    }
+
+    /// Accepted attributes count nothing at this stage: like the Engine API preflight, a pass is
+    /// not yet a validated post-exec transaction — the import path counts that.
+    #[test]
+    fn accepted_attributes_count_nothing() {
+        use reth_metrics::metrics::with_local_recorder;
+
+        let (recorder, handle) = recorder();
+
+        let result = with_local_recorder(&recorder, || {
+            OpPayloadBuilderAttributes::<OpTransactionSigned>::from_rpc_attrs(
+                B256::ZERO,
+                PayloadId::new([0; 8]),
+                attrs_with_post_exec(0),
+            )
+        });
+        assert!(result.is_ok(), "a post-exec transaction with no entries is structurally valid");
+
+        let exposition = handle.render();
+        assert!(
+            !exposition.contains("reth_op_sdm_post_exec_validation"),
+            "the attributes path must not count a pass: {exposition}"
+        );
     }
 }

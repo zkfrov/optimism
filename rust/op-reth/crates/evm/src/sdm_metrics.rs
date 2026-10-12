@@ -4,8 +4,9 @@
 //! dashboard can show SDM validation activity rather than inferring it from generic block
 //! validation.
 //!
-//! Recorded from the execution-context builders and the Engine API payload preflight. Beyond
-//! live import, several paths re-execute stored canonical blocks that already passed this check:
+//! Recorded from the execution-context builders, the Engine API payload preflight, and the
+//! payload-builder attributes preflight. Beyond live import, several paths re-execute stored
+//! canonical blocks that already passed this check:
 //! RPC replays, the proofs ExEx's periodic re-execution, and pipeline or backfill sync.
 //! Re-execution cannot inflate the failure counters, but every pass recounts `ok` — on a
 //! verifying proofs node `ok` runs at roughly twice the block rate and it spikes while a node
@@ -101,11 +102,34 @@ pub(crate) fn report_post_exec_validation_failure(
         %error,
         "block rejected: post-exec transaction failed structural validation"
     );
+    count_post_exec_failure(reason);
+}
+
+/// Counts one failed validation under its rule; a no-op without `std`.
+fn count_post_exec_failure(reason: &'static str) {
     #[cfg(feature = "std")]
     {
         failure_counter(reason).increment(1);
         result_counter(RESULT_FAIL).increment(1);
     }
+    #[cfg(not(feature = "std"))]
+    let _ = reason;
+}
+
+/// Logs payload-builder attributes rejected for their post-exec transaction and counts the
+/// rejection like [`report_post_exec_validation_failure`], attributed to the parent block hash.
+pub(crate) fn report_post_exec_attributes_rejection(
+    parent_hash: alloy_primitives::B256,
+    error: PostExecPayloadValidationError,
+) {
+    let reason = error.as_reason();
+    tracing::warn!(
+        %parent_hash,
+        reason,
+        %error,
+        "payload attributes rejected: post-exec transaction failed structural validation"
+    );
+    count_post_exec_failure(reason);
 }
 
 #[cfg(all(test, feature = "std"))]
@@ -294,6 +318,28 @@ mod tests {
         let (result, exposition) = preflight(transactions);
 
         assert!(result.is_err(), "preflight rejects");
+        assert_failures(&exposition, Some(reason));
+        assert_results(&exposition, /* ok */ 0.0, /* fail */ 1.0);
+    }
+
+    #[rstest]
+    #[case::multiple(vec![bare_post_exec(), bare_post_exec()], "multiple_post_exec_txs")]
+    #[case::not_last(vec![bare_post_exec(), filler()], "post_exec_tx_not_last")]
+    #[case::too_many_entries(vec![filler(), encoded_post_exec(2)], "too_many_gas_refund_entries")]
+    #[case::malformed(vec![bare_post_exec()], "malformed_post_exec_payload")]
+    #[case::unsupported_version(vec![filler(), versioned_post_exec(2)], "unsupported_post_exec_payload_version")]
+    fn rejected_attributes_count_on_the_attributes_path(
+        #[case] transactions: Vec<alloy_primitives::Bytes>,
+        #[case] reason: &str,
+    ) {
+        let (recorder, handle) = recorder();
+        let result = with_local_recorder(&recorder, || {
+            super::register_sdm_metrics_at_zero();
+            crate::validate_post_exec_attributes(&transactions, alloy_primitives::B256::ZERO)
+        });
+        let exposition = handle.render();
+
+        assert!(result.is_err(), "attributes preflight rejects");
         assert_failures(&exposition, Some(reason));
         assert_results(&exposition, /* ok */ 0.0, /* fail */ 1.0);
     }
