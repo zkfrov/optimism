@@ -182,12 +182,6 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
         // game type is one of them.
         _validateDisputeGameConfigs(_input.disputeGameConfigs, _input.startingRespectedGameType);
 
-        // Check that every chain agrees on the DelayedWETH withdrawal delay. New games for every
-        // migrated chain are created against the first chain's DelayedWETH, so a disagreement
-        // would silently change the lockup for the other chains. Checked before any contract is
-        // touched so the whole migration reverts early.
-        _assertSharedWithdrawalDelay(_input.chainSystemConfigs);
-
         // NOTE: Interop doesn't have a real chain ID, and the chain ID provided here is ONLY used
         // as a salt mixer, so we just use the block.timestamp instead. It really doesn't matter
         // what we use here.
@@ -334,11 +328,8 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
                 revert OPContractsManagerMigrator_SuperchainConfigMismatch();
             }
 
-            // Each chain must have the same finality delay, since the shared AnchorStateRegistry holds one.
-            if (_disputeGameFinalityDelay(_chainSystemConfigs[i]) != _disputeGameFinalityDelay(_chainSystemConfigs[0]))
-            {
-                revert OPContractsManagerMigrator_DisputeGameFinalityDelayMismatch();
-            }
+            // Each chain must have the same finality and DelayedWETH delays.
+            _assertSameDelays(_chainSystemConfigs[i], _chainSystemConfigs[0]);
 
             // migrate() is the only thing that sets INTEROP on L1 and SystemConfig does not allow
             // clearing it, so the flag means this chain is already in an interop set. Re-migrating
@@ -617,16 +608,20 @@ contract OPContractsManagerMigrator is OPContractsManagerUtilsCaller {
             .disputeGameFinalityDelaySeconds();
     }
 
-    /// @notice Reverts unless every chain being migrated has the same DelayedWETH withdrawal delay.
-    ///         The first chain's DelayedWETH becomes the shared one, so its delay is the value the
-    ///         other chains inherit for new games.
-    /// @param _chainSystemConfigs The chain system configs being migrated.
-    function _assertSharedWithdrawalDelay(ISystemConfig[] calldata _chainSystemConfigs) internal view {
-        uint256 sharedDelay = IDelayedWETH(payable(_chainSystemConfigs[0].delayedWETH())).delay();
-        for (uint256 i = 1; i < _chainSystemConfigs.length; i++) {
-            if (IDelayedWETH(payable(_chainSystemConfigs[i].delayedWETH())).delay() != sharedDelay) {
-                revert OPContractsManagerMigrator_WithdrawalDelayMismatch();
-            }
+    /// @notice Reverts unless a chain has the same finality and DelayedWETH delays as the first
+    ///         chain. The shared AnchorStateRegistry and DelayedWETH hold one value each, so a
+    ///         disagreement would silently change the delays for the other chains.
+    /// @param _systemConfig The system config for the chain being checked.
+    /// @param _firstSystemConfig The system config for the first chain.
+    function _assertSameDelays(ISystemConfig _systemConfig, ISystemConfig _firstSystemConfig) internal view {
+        if (_disputeGameFinalityDelay(_systemConfig) != _disputeGameFinalityDelay(_firstSystemConfig)) {
+            revert OPContractsManagerMigrator_DisputeGameFinalityDelayMismatch();
+        }
+        if (
+            IDelayedWETH(payable(_systemConfig.delayedWETH())).delay()
+                != IDelayedWETH(payable(_firstSystemConfig.delayedWETH())).delay()
+        ) {
+            revert OPContractsManagerMigrator_WithdrawalDelayMismatch();
         }
     }
 
